@@ -5,6 +5,7 @@ defmodule Jido.Claude.Mapper do
 
   alias ClaudeAgentSDK.Message
   alias Jido.Harness.Event
+  alias Jido.Harness.Event.Usage, as: UsageEvent
 
   @doc """
   Maps a Claude SDK message into one or more normalized harness events.
@@ -34,6 +35,19 @@ defmodule Jido.Claude.Mapper do
     {:ok, events}
   end
 
+  # User messages may contain tool_result blocks (tool execution outputs)
+  def map_message(%Message{type: :user, data: data} = message) when is_map(data) do
+    session_id = map_get(data, :session_id)
+    blocks = Message.content_blocks(message)
+
+    tool_results =
+      blocks
+      |> Enum.filter(&(is_map(&1) and &1[:type] == :tool_result))
+      |> Enum.flat_map(&map_assistant_block(&1, session_id, message))
+
+    {:ok, tool_results}
+  end
+
   def map_message(%Message{type: :result, subtype: :success, data: data} = message) when is_map(data) do
     payload = %{
       "result" => map_get(data, :result),
@@ -42,7 +56,9 @@ defmodule Jido.Claude.Mapper do
       "is_error" => map_get(data, :is_error, false)
     }
 
-    {:ok, [build_event(:session_completed, map_get(data, :session_id), payload, message)]}
+    usage_event = maybe_result_usage(data, message)
+
+    {:ok, List.wrap(usage_event) ++ [build_event(:session_completed, map_get(data, :session_id), payload, message)]}
   end
 
   def map_message(%Message{type: :result, data: data} = message) when is_map(data) do
@@ -56,19 +72,10 @@ defmodule Jido.Claude.Mapper do
 
   def map_message(%Message{type: :stream_event, data: data} = message) when is_map(data) do
     event = map_get(data, :event, %{})
+    session_id = map_get(data, :session_id)
+    event_type = map_get(event, :type) || map_get(event, "type")
 
-    text =
-      event
-      |> map_get(:delta, %{})
-      |> map_get(:text)
-
-    events =
-      if is_binary(text) and text != "" do
-        [build_event(:output_text_delta, map_get(data, :session_id), %{"text" => text}, message)]
-      else
-        [build_event(:provider_event, map_get(data, :session_id), %{"event" => inspect(event)}, message)]
-      end
-
+    events = parse_stream_event(event_type, event, session_id, message)
     {:ok, events}
   end
 
@@ -148,5 +155,64 @@ defmodule Jido.Claude.Mapper do
 
   defp map_get(map, key, default \\ nil) when is_map(map) and is_atom(key) do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  end
+
+  # ── Stream event sub-dispatchers ──
+
+  defp parse_stream_event(type, _event, _session_id, _message)
+       when type in ["message_start", :message_start] do
+    # Token counts are consolidated into the single :usage event emitted by the :result handler
+    []
+  end
+
+  defp parse_stream_event(type, _event, _session_id, _message)
+       when type in ["message_delta", :message_delta] do
+    # Token counts are consolidated into the single :usage event emitted by the :result handler
+    []
+  end
+
+  defp parse_stream_event(type, _event, session_id, message)
+       when type in ["message_stop", :message_stop] do
+    # Turn boundary
+    [build_event(:turn_end, session_id, %{}, message)]
+  end
+
+  defp parse_stream_event(_type, event, session_id, message) do
+    # Default: try to extract text delta
+    text =
+      event
+      |> map_get(:delta, %{})
+      |> map_get(:text)
+
+    if is_binary(text) and text != "" do
+      [build_event(:output_text_delta, session_id, %{"text" => text}, message)]
+    else
+      []
+    end
+  end
+
+  # Build a canonical :usage event from result data using UsageEvent.build/3
+  defp maybe_result_usage(data, message) do
+    cost = map_get(data, :total_cost_usd)
+    duration = map_get(data, :duration_ms)
+    session_id = map_get(data, :session_id) || ""
+    usage = map_get(data, :usage, %{}) || %{}
+    model = map_get(data, :model)
+
+    input_tokens = map_get(usage, :input_tokens, 0) || 0
+    output_tokens = map_get(usage, :output_tokens, 0) || 0
+
+    if cost || duration || input_tokens > 0 || output_tokens > 0 do
+      UsageEvent.build(:claude, session_id,
+        input_tokens: input_tokens,
+        output_tokens: output_tokens,
+        cost_usd: cost,
+        duration_ms: duration,
+        model: if(model, do: to_string(model)),
+        raw: message
+      )
+    else
+      nil
+    end
   end
 end
