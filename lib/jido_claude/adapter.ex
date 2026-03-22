@@ -19,7 +19,8 @@ defmodule Jido.Claude.Adapter do
     :verbose,
     :include_partial_messages,
     :output_format,
-    :env
+    :env,
+    :max_thinking_tokens
   ]
 
   @impl true
@@ -34,6 +35,7 @@ defmodule Jido.Claude.Adapter do
       tool_calls?: true,
       tool_results?: true,
       thinking?: true,
+      usage?: true,
       cancellation?: false
     }
   end

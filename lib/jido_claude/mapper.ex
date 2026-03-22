@@ -157,18 +157,70 @@ defmodule Jido.Claude.Mapper do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
   end
 
-  # ── Stream event sub-dispatchers ──
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  defp parse_stream_event(type, _event, _session_id, _message)
-       when type in ["message_start", :message_start] do
-    # Token counts are consolidated into the single :usage event emitted by the :result handler
-    []
+  # Extract usage from nested message_start event structure
+  # Handles both atom and string keys: event.message.usage or event["message"]["usage"]
+  defp extract_nested_usage(event) do
+    msg = map_get(event, :message, %{}) || %{}
+    usage = map_get(msg, :usage, %{}) || %{}
+
+    %{}
+    |> maybe_put(:input_tokens, map_get(usage, :input_tokens))
+    |> maybe_put(:cache_creation_input_tokens, map_get(usage, :cache_creation_input_tokens))
+    |> maybe_put(:cache_read_input_tokens, map_get(usage, :cache_read_input_tokens))
   end
 
-  defp parse_stream_event(type, _event, _session_id, _message)
+  defp get_in_map(map, []), do: map
+
+  defp get_in_map(map, [key | rest]) when is_map(map) do
+    value = map_get(map, key)
+    if value, do: get_in_map(value, rest), else: nil
+  end
+
+  defp get_in_map(_, _), do: nil
+
+  # ── Stream event sub-dispatchers ──
+
+  defp parse_stream_event(type, event, session_id, message)
+       when type in ["message_start", :message_start] do
+    # Extract per-message usage snapshot (input + cache tokens)
+    usage = extract_nested_usage(event)
+
+    if map_size(usage) > 0 do
+      model = get_in_map(event, [:message, :model]) || get_in_map(event, ["message", "model"])
+
+      payload =
+        %{"source" => "message_start"}
+        |> maybe_put("model", model)
+        |> maybe_put("input_tokens", usage[:input_tokens])
+        |> maybe_put("cache_creation_input_tokens", usage[:cache_creation_input_tokens])
+        |> maybe_put("cache_read_input_tokens", usage[:cache_read_input_tokens])
+
+      [build_event(:provider_event, session_id, payload, message)]
+    else
+      []
+    end
+  end
+
+  defp parse_stream_event(type, event, session_id, message)
        when type in ["message_delta", :message_delta] do
-    # Token counts are consolidated into the single :usage event emitted by the :result handler
-    []
+    # Extract output token count and stop reason
+    usage = map_get(event, :usage, %{}) || %{}
+    delta = map_get(event, :delta, %{}) || %{}
+    output_tokens = map_get(usage, :output_tokens)
+    stop_reason = map_get(delta, :stop_reason)
+
+    if output_tokens do
+      payload =
+        %{"source" => "message_delta", "output_tokens" => output_tokens}
+        |> maybe_put("stop_reason", stop_reason)
+
+      [build_event(:provider_event, session_id, payload, message)]
+    else
+      []
+    end
   end
 
   defp parse_stream_event(type, _event, session_id, message)
@@ -201,11 +253,15 @@ defmodule Jido.Claude.Mapper do
 
     input_tokens = map_get(usage, :input_tokens, 0) || 0
     output_tokens = map_get(usage, :output_tokens, 0) || 0
+    cached_input_tokens =
+      (map_get(usage, :cache_read_input_tokens, 0) || 0) +
+        (map_get(usage, :cache_creation_input_tokens, 0) || 0)
 
     if cost || duration || input_tokens > 0 || output_tokens > 0 do
       UsageEvent.build(:claude, session_id,
         input_tokens: input_tokens,
         output_tokens: output_tokens,
+        cached_input_tokens: cached_input_tokens,
         cost_usd: cost,
         duration_ms: duration,
         model: if(model, do: to_string(model)),
