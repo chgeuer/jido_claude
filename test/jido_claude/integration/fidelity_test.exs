@@ -271,7 +271,7 @@ defmodule Jido.Claude.Mapper.FidelityTest do
       }
 
       assert {:ok, [event]} = Mapper.map_message(message)
-      assert event.type == :tool_call
+      assert event.type == :tool_use_start
       assert event.payload["name"] == "Read"
       assert event.payload["input"] == %{"file_path" => "/src/main.ex"}
       assert event.payload["call_id"] == "toolu_123"
@@ -298,7 +298,7 @@ defmodule Jido.Claude.Mapper.FidelityTest do
       }
 
       assert {:ok, [event]} = Mapper.map_message(message)
-      assert event.type == :tool_call
+      assert event.type == :tool_use_start
       assert event.payload["name"] == "web_search"
       assert event.payload["server_tool"] == true
       assert event.payload["call_id"] == "toolu_srv_1"
@@ -326,7 +326,7 @@ defmodule Jido.Claude.Mapper.FidelityTest do
       }
 
       assert {:ok, [event]} = Mapper.map_message(message)
-      assert event.type == :tool_result
+      assert event.type == :tool_use_end
       assert event.payload["output"] == "file contents here"
       assert event.payload["call_id"] == "toolu_123"
       assert event.payload["is_error"] == false

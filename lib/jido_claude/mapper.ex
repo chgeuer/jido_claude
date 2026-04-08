@@ -118,7 +118,7 @@ defmodule Jido.Claude.Mapper do
   defp map_assistant_block(%{type: :server_tool_use, name: name} = block, session_id, message) do
     [
       build_event(
-        :tool_call,
+        :tool_use_start,
         session_id,
         %{
           "name" => name,
@@ -144,7 +144,7 @@ defmodule Jido.Claude.Mapper do
       "server_tool_use" ->
         [
           build_event(
-            :tool_call,
+            :tool_use_start,
             session_id,
             %{
               "name" => raw["name"],
@@ -162,7 +162,7 @@ defmodule Jido.Claude.Mapper do
   end
 
   defp map_assistant_block(%{type: :tool_use, name: name, input: input, id: id}, session_id, message) do
-    [build_event(:tool_call, session_id, %{"name" => name, "input" => input || %{}, "call_id" => id}, message)]
+    [build_event(:tool_use_start, session_id, %{"name" => name, "input" => input || %{}, "call_id" => id}, message)]
   end
 
   defp map_assistant_block(
@@ -172,7 +172,7 @@ defmodule Jido.Claude.Mapper do
        ) do
     [
       build_event(
-        :tool_result,
+        :tool_use_end,
         session_id,
         %{"output" => content, "call_id" => tool_use_id, "is_error" => is_error},
         message
