@@ -12,11 +12,15 @@ defmodule Jido.Claude.Mapper do
   """
   @spec map_message(term()) :: {:ok, [Event.t()]} | {:error, term()}
   def map_message(%Message{type: :system, subtype: :init, data: data} = message) when is_map(data) do
-    payload = %{
-      "cwd" => map_get(data, :cwd),
-      "model" => map_get(data, :model),
-      "tools" => map_get(data, :tools, [])
-    }
+    payload =
+      %{
+        "cwd" => map_get(data, :cwd),
+        "model" => map_get(data, :model),
+        "tools" => map_get(data, :tools, [])
+      }
+      |> maybe_put("api_key_source", map_get(data, :api_key_source))
+      |> maybe_put("permission_mode", map_get(data, :permission_mode))
+      |> maybe_put("mcp_servers", map_get(data, :mcp_servers))
 
     {:ok, [build_event(:session_started, map_get(data, :session_id), payload, message)]}
   end
@@ -49,12 +53,15 @@ defmodule Jido.Claude.Mapper do
   end
 
   def map_message(%Message{type: :result, subtype: :success, data: data} = message) when is_map(data) do
-    payload = %{
-      "result" => map_get(data, :result),
-      "num_turns" => map_get(data, :num_turns),
-      "duration_ms" => map_get(data, :duration_ms),
-      "is_error" => map_get(data, :is_error, false)
-    }
+    payload =
+      %{
+        "result" => map_get(data, :result),
+        "num_turns" => map_get(data, :num_turns),
+        "duration_ms" => map_get(data, :duration_ms),
+        "is_error" => map_get(data, :is_error, false)
+      }
+      |> maybe_put("duration_api_ms", map_get(data, :duration_api_ms))
+      |> maybe_put("stop_reason", map_get(data, :stop_reason))
 
     usage_event = maybe_result_usage(data, message)
 
@@ -91,8 +98,67 @@ defmodule Jido.Claude.Mapper do
     [build_event(:output_text_delta, session_id, %{"text" => text}, message)]
   end
 
-  defp map_assistant_block(%{type: :thinking, thinking: thinking}, session_id, message) when is_binary(thinking) do
-    [build_event(:thinking_delta, session_id, %{"text" => thinking}, message)]
+  defp map_assistant_block(%{type: :thinking, thinking: thinking} = block, session_id, message)
+       when is_binary(thinking) do
+    payload =
+      %{"text" => thinking}
+      |> maybe_put("signature", Map.get(block, :signature))
+
+    [build_event(:thinking_delta, session_id, payload, message)]
+  end
+
+  defp map_assistant_block(%{type: :redacted_thinking} = block, session_id, message) do
+    payload =
+      %{"redacted" => true}
+      |> maybe_put("data", Map.get(block, :data))
+
+    [build_event(:thinking_delta, session_id, payload, message)]
+  end
+
+  defp map_assistant_block(%{type: :server_tool_use, name: name} = block, session_id, message) do
+    [
+      build_event(
+        :tool_call,
+        session_id,
+        %{
+          "name" => name,
+          "input" => Map.get(block, :input) || %{},
+          "call_id" => Map.get(block, :id),
+          "server_tool" => true
+        },
+        message
+      )
+    ]
+  end
+
+  # Handle blocks normalized to :unknown by the SDK (e.g., redacted_thinking, server_tool_use)
+  defp map_assistant_block(%{type: :unknown, raw: raw}, session_id, message) when is_map(raw) do
+    case raw["type"] do
+      "redacted_thinking" ->
+        payload =
+          %{"redacted" => true}
+          |> maybe_put("data", raw["data"])
+
+        [build_event(:thinking_delta, session_id, payload, message)]
+
+      "server_tool_use" ->
+        [
+          build_event(
+            :tool_call,
+            session_id,
+            %{
+              "name" => raw["name"],
+              "input" => raw["input"] || %{},
+              "call_id" => raw["id"],
+              "server_tool" => true
+            },
+            message
+          )
+        ]
+
+      _ ->
+        []
+    end
   end
 
   defp map_assistant_block(%{type: :tool_use, name: name, input: input, id: id}, session_id, message) do
@@ -157,24 +223,87 @@ defmodule Jido.Claude.Mapper do
     Map.get(map, key, Map.get(map, Atom.to_string(key), default))
   end
 
-  # ── Stream event sub-dispatchers ──
+  defp maybe_put(map, _key, nil), do: map
+  defp maybe_put(map, key, value), do: Map.put(map, key, value)
 
-  defp parse_stream_event(type, _event, _session_id, _message)
-       when type in ["message_start", :message_start] do
-    # Token counts are consolidated into the single :usage event emitted by the :result handler
-    []
+  # Extract usage from nested message_start event structure
+  # Handles both atom and string keys: event.message.usage or event["message"]["usage"]
+  defp extract_nested_usage(event) do
+    msg = map_get(event, :message, %{}) || %{}
+    usage = map_get(msg, :usage, %{}) || %{}
+
+    %{}
+    |> maybe_put(:input_tokens, map_get(usage, :input_tokens))
+    |> maybe_put(:cache_creation_input_tokens, map_get(usage, :cache_creation_input_tokens))
+    |> maybe_put(:cache_read_input_tokens, map_get(usage, :cache_read_input_tokens))
   end
 
-  defp parse_stream_event(type, _event, _session_id, _message)
+  defp get_in_map(map, []), do: map
+
+  defp get_in_map(map, [key | rest]) when is_map(map) do
+    value = map_get(map, key)
+    if value, do: get_in_map(value, rest), else: nil
+  end
+
+  defp get_in_map(_, _), do: nil
+
+  # ── Stream event sub-dispatchers ──
+
+  defp parse_stream_event(type, event, session_id, message)
+       when type in ["message_start", :message_start] do
+    # Extract per-message usage snapshot (input + cache tokens)
+    usage = extract_nested_usage(event)
+
+    if map_size(usage) > 0 do
+      model = get_in_map(event, [:message, :model]) || get_in_map(event, ["message", "model"])
+
+      payload =
+        %{"source" => "message_start"}
+        |> maybe_put("model", model)
+        |> maybe_put("input_tokens", usage[:input_tokens])
+        |> maybe_put("cache_creation_input_tokens", usage[:cache_creation_input_tokens])
+        |> maybe_put("cache_read_input_tokens", usage[:cache_read_input_tokens])
+
+      [build_event(:provider_event, session_id, payload, message)]
+    else
+      []
+    end
+  end
+
+  defp parse_stream_event(type, event, session_id, message)
        when type in ["message_delta", :message_delta] do
-    # Token counts are consolidated into the single :usage event emitted by the :result handler
-    []
+    # Extract output token count and stop reason
+    usage = map_get(event, :usage, %{}) || %{}
+    delta = map_get(event, :delta, %{}) || %{}
+    output_tokens = map_get(usage, :output_tokens)
+    stop_reason = map_get(delta, :stop_reason)
+
+    if output_tokens do
+      payload =
+        %{"source" => "message_delta", "output_tokens" => output_tokens}
+        |> maybe_put("stop_reason", stop_reason)
+
+      [build_event(:provider_event, session_id, payload, message)]
+    else
+      []
+    end
   end
 
   defp parse_stream_event(type, _event, session_id, message)
        when type in ["message_stop", :message_stop] do
-    # Turn boundary
     [build_event(:turn_end, session_id, %{}, message)]
+  end
+
+  defp parse_stream_event(type, event, session_id, message)
+       when type in ["error", :error] do
+    error_data = map_get(event, :error, %{}) || %{}
+
+    payload =
+      %{"source" => "stream_error"}
+      |> maybe_put("error_type", map_get(error_data, :type))
+      |> maybe_put("message", map_get(error_data, :message))
+
+    [build_event(:provider_event, session_id, payload, message)]
   end
 
   defp parse_stream_event(_type, event, session_id, message) do
@@ -195,22 +324,38 @@ defmodule Jido.Claude.Mapper do
   defp maybe_result_usage(data, message) do
     cost = map_get(data, :total_cost_usd)
     duration = map_get(data, :duration_ms)
+    duration_api = map_get(data, :duration_api_ms)
     session_id = map_get(data, :session_id) || ""
     usage = map_get(data, :usage, %{}) || %{}
     model = map_get(data, :model)
+    stop_reason = map_get(data, :stop_reason)
 
     input_tokens = map_get(usage, :input_tokens, 0) || 0
     output_tokens = map_get(usage, :output_tokens, 0) || 0
+    cache_read = map_get(usage, :cache_read_input_tokens, 0) || 0
+    cache_creation = map_get(usage, :cache_creation_input_tokens, 0) || 0
+    cached_input_tokens = cache_read + cache_creation
 
     if cost || duration || input_tokens > 0 || output_tokens > 0 do
-      UsageEvent.build(:claude, session_id,
-        input_tokens: input_tokens,
-        output_tokens: output_tokens,
-        cost_usd: cost,
-        duration_ms: duration,
-        model: if(model, do: to_string(model)),
-        raw: message
-      )
+      event =
+        UsageEvent.build(:claude, session_id,
+          input_tokens: input_tokens,
+          output_tokens: output_tokens,
+          cached_input_tokens: cached_input_tokens,
+          cost_usd: cost,
+          duration_ms: duration,
+          model: if(model, do: to_string(model)),
+          raw: message
+        )
+
+      enriched_payload =
+        event.payload
+        |> maybe_put("cache_read_input_tokens", if(cache_read > 0, do: cache_read))
+        |> maybe_put("cache_creation_input_tokens", if(cache_creation > 0, do: cache_creation))
+        |> maybe_put("duration_api_ms", duration_api)
+        |> maybe_put("stop_reason", stop_reason)
+
+      %{event | payload: enriched_payload}
     else
       nil
     end
