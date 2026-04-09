@@ -15,6 +15,7 @@ defmodule Jido.Claude.Adapter do
     :timeout_ms,
     :system_prompt,
     :allowed_tools,
+    :disallowed_tools,
     :cwd,
     :verbose,
     :include_partial_messages,
@@ -23,7 +24,10 @@ defmodule Jido.Claude.Adapter do
     :max_thinking_tokens,
     :thinking,
     :effort,
-    :fallback_model
+    :fallback_model,
+    :permission_mode,
+    :permission_prompt_tool,
+    :mcp_servers
   ]
 
   @impl true
@@ -47,9 +51,12 @@ defmodule Jido.Claude.Adapter do
   @spec run(RunRequest.t(), keyword()) :: {:ok, Enumerable.t()} | {:error, term()}
   def run(%RunRequest{} = request, opts \\ []) when is_list(opts) do
     with {:ok, options} <- build_options(request, opts) do
+      # Pass transport from harness opts to the SDK (for vsock/remote execution)
+      transport = Keyword.get(opts, :transport)
+
       stream =
         sdk_module()
-        |> apply(:query, [request.prompt, options])
+        |> apply(:query, [request.prompt, options, transport])
         |> Stream.flat_map(fn message ->
           case mapper_module().map_message(message) do
             {:ok, events} when is_list(events) ->

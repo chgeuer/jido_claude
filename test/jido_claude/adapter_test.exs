@@ -15,6 +15,10 @@ defmodule Jido.Claude.AdapterTest do
     def query(prompt, opts) do
       Application.get_env(:jido_claude, :stub_adapter_query, fn _prompt, _opts -> [] end).(prompt, opts)
     end
+
+    def query(prompt, opts, _transport) do
+      query(prompt, opts)
+    end
   end
 
   setup do
